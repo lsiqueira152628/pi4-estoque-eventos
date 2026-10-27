@@ -48,6 +48,10 @@ SENHA_ESTOQUE = "..."
 SENHA_VENDAS = "..."
 ```
 
+O botão de retreinar o modelo (página **Modelo de ML**) fica desligado por padrão, para que testes na versão
+publicada não alterem as métricas. Para ligá-lo, defina `PERMITIR_RETREINO = "1"` nos Secrets ou como variável
+de ambiente. O script `treinar_modelo.py` continua treinando o modelo pela linha de comando.
+
 ## Acesso pelo celular
 
 - **Mesma rede Wi-Fi:** com o app rodando no computador, abra no celular o endereço "Network URL" que o

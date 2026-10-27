@@ -4,6 +4,7 @@ Uso:  streamlit run app.py
 """
 import json
 import math
+import os
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -21,6 +22,9 @@ CORES = px.colors.qualitative.Safe
 px.defaults.color_discrete_sequence = CORES
 PONTOS_VENDA = ["Bar Central", "Bar Pista", "Quiosque Norte", "Praça de Alimentação"]
 FORMAS_PAGAMENTO = ["Pix", "Crédito", "Débito", "Pulseira cashless"]
+# Na versão publicada o retreino fica desligado, para os testes do grupo não alterarem as métricas do relatório.
+# Para liberar: PERMITIR_RETREINO = "1" nos Secrets do Streamlit Cloud (ou variável de ambiente local).
+PERMITIR_RETREINO = os.environ.get("PERMITIR_RETREINO", "0") == "1"
 
 
 @st.cache_resource
@@ -547,11 +551,15 @@ def pagina_previsao(usuario):
 def pagina_modelo():
     st.title("🤖 Modelo de aprendizado de máquina")
     m = metricas_modelo()
-    if st.button("Treinar / retreinar modelo com o histórico atual"):
-        with st.spinner("Treinando e avaliando modelos..."):
-            ml.treinar(con)
-        invalidar()
-        st.rerun()
+    if PERMITIR_RETREINO:
+        if st.button("Treinar / retreinar modelo com o histórico atual"):
+            with st.spinner("Treinando e avaliando modelos..."):
+                ml.treinar(con)
+            invalidar()
+            st.rerun()
+    else:
+        st.caption("Resultados do modelo treinado com a base simulada original. O retreino está desativado nesta "
+                   "versão de demonstração para preservar as métricas apresentadas no relatório.")
     if m is None:
         st.info("Modelo ainda não treinado.")
         return
