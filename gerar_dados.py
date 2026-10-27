@@ -166,6 +166,7 @@ def main():
     lotes = {p["id"]: [] for p in produtos}  # lotes em aberto: dict(id, validade, saldo, custo)
     seq_lote = 0
     movs, vendas = [], []
+    total_vendas = 0
 
     def registrar_perdas_vencidas(ate: date):
         for p in produtos:
@@ -292,6 +293,15 @@ def main():
                     movs.append((fim_ev + timedelta(days=1), "PERDA_AVARIA", p["id"], lote["id"], None, q,
                                  str(rng.choice(USUARIOS)), "Avaria identificada na conferência"))
 
+        # grava as vendas evento a evento para não acumular milhões de registros na memória
+        vendas.sort(key=lambda v: v[0])
+        cur.executemany(
+            "INSERT INTO vendas (data_hora, evento_id, produto_id, lote_id, ponto_venda, quantidade, preco_unitario,"
+            " forma_pagamento) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [(v[0].isoformat(sep=" ", timespec="seconds"),) + v[1:] for v in vendas])
+        total_vendas += len(vendas)
+        vendas.clear()
+
     registrar_perdas_vencidas(HOJE)
 
     movs.sort(key=lambda m: m[0])
@@ -299,17 +309,12 @@ def main():
         "INSERT INTO movimentacoes (data_hora, tipo, produto_id, lote_id, evento_id, quantidade, usuario, observacao)"
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [(m[0].isoformat(sep=" ", timespec="minutes"),) + m[1:] for m in movs])
-    vendas.sort(key=lambda v: v[0])
-    cur.executemany(
-        "INSERT INTO vendas (data_hora, evento_id, produto_id, lote_id, ponto_venda, quantidade, preco_unitario,"
-        " forma_pagamento) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [(v[0].isoformat(sep=" ", timespec="seconds"),) + v[1:] for v in vendas])
     con.commit()
 
     n_real = sum(e["status"] == "Realizado" for e in eventos)
     print(f"Banco gerado em {DB_PATH}")
     print(f"  produtos: {len(produtos)} | eventos realizados: {n_real} | planejados: {len(eventos) - n_real}")
-    print(f"  lotes: {seq_lote} | movimentações: {len(movs)} | registros de venda: {len(vendas)}")
+    print(f"  lotes: {seq_lote} | movimentações: {len(movs)} | registros de venda: {total_vendas}")
     con.close()
 
 
