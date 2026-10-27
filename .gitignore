@@ -1,0 +1,6 @@
+dados/
+powerbi/
+modelos/
+__pycache__/
+.venv/
+.claude/
