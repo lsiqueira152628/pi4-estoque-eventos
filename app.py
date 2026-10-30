@@ -17,6 +17,7 @@ import auth
 import gerar_dados
 import ml
 from db import DB_PATH, conectar, consultar, criar_banco
+from produtos_casa import PRODUTOS_CASA
 
 st.set_page_config(page_title="Estoque e Vendas em Eventos", page_icon="📦", layout="wide",
                    initial_sidebar_state="collapsed")
@@ -30,6 +31,11 @@ PONTOS_VENDA = ["BAR 3º ANDAR", "BAR 4º ANDAR", "CONCESSÃO 103", "CONCESSÃO 
 FORMAS_PAGAMENTO = ["Pix", "Crédito", "Débito", "Pulseira cashless"]
 CATEGORIAS = ["Bebida alcoólica", "Bebida não alcoólica", "Café", "Doce", "Lanche", "Snack"]
 TIPOS_EVENTO = ["Show", "Festival", "Evento corporativo", "Evento infantil", "E-sports"]
+# Valores usados quando o cadastro informa só nome, categoria e preço: unidade, validade (dias) e embalagem.
+PADRAO_CATEGORIA = {"Bebida alcoólica": ("un", 180, 12), "Bebida não alcoólica": ("un", 180, 12),
+                    "Café": ("dose", 120, 50), "Doce": ("un", 90, 30), "Lanche": ("un", 3, 20),
+                    "Snack": ("pacote", 90, 40)}
+CUSTO_PADRAO = 0.35  # custo estimado como fração do preço, até a gestão informar o valor real
 # O servidor do Streamlit Cloud roda em UTC; datas e horários do sistema seguem o horário de Brasília.
 FUSO = timezone(timedelta(hours=-3))
 # Na versão publicada o retreino fica desligado, para os testes do grupo não alterarem as métricas do relatório.
@@ -48,7 +54,22 @@ def get_con():
     con = conectar()
     criar_banco(con)
     auth.garantir_usuarios_demo(con)
+    carregar_produtos_casa(con)
     return con
+
+
+def carregar_produtos_casa(con):
+    """Inclui os produtos da casa que ainda não existem: sem preço e inativos até a gestão informar o preço."""
+    # Comparação em Python: o lower() do SQLite não converte letras acentuadas (Á, É...).
+    existentes = {r[0].strip().lower() for r in con.execute("SELECT nome FROM produtos")}
+    for cat, nomes in PRODUTOS_CASA.items():
+        unidade, validade, emb = PADRAO_CATEGORIA[cat]
+        for nome in nomes:
+            if nome.lower() not in existentes:
+                con.execute("INSERT INTO produtos (nome, categoria, unidade, preco_venda, custo_unitario, validade_dias,"
+                            " embalagem, estoque_minimo, ativo) VALUES (?, ?, ?, 0, 0, ?, ?, 0, 0)",
+                            (nome, cat, unidade, validade, emb))
+    con.commit()
 
 
 con = get_con()
@@ -123,8 +144,9 @@ def produtos_ativos():
 
 
 def nome_em_uso(nome, exceto_id=None):
-    return not q("SELECT id FROM produtos WHERE lower(trim(nome)) = lower(?) AND id IS NOT ?",
-                 (nome.strip(), exceto_id)).empty
+    prods = produtos()
+    iguais = prods["nome"].str.strip().str.lower() == nome.strip().lower()
+    return bool((iguais & (prods["id"] != exceto_id)).any())
 
 
 @st.cache_data
@@ -145,19 +167,28 @@ def saldo_lotes():
     return q("SELECT * FROM vw_saldo_lotes WHERE saldo <> 0 ORDER BY produto, data_validade")
 
 
-def estoque_no_evento(evento_id):
-    return q("""
-        SELECT m.produto_id, p.nome AS produto, m.lote_id, l.codigo, l.data_validade,
+def estoque_no_evento(evento_id, lanchonete=None):
+    """Saldo no evento por produto, lote e lanchonete: enviado - devolvido - vendido naquela lanchonete."""
+    df = q("""
+        SELECT m.produto_id, p.nome AS produto, m.lote_id, l.codigo, l.data_validade, m.ponto_venda AS lanchonete,
                SUM(CASE WHEN m.tipo = 'SAIDA_EVENTO' THEN m.quantidade ELSE -m.quantidade END)
                - COALESCE((SELECT SUM(v.quantidade) FROM vendas v
-                           WHERE v.evento_id = m.evento_id AND v.lote_id = m.lote_id), 0) AS saldo_evento
+                           WHERE v.evento_id = m.evento_id AND v.lote_id = m.lote_id
+                             AND v.ponto_venda IS m.ponto_venda), 0) AS saldo_evento
         FROM movimentacoes m
         JOIN produtos p ON p.id = m.produto_id
         JOIN lotes l ON l.id = m.lote_id
         WHERE m.evento_id = ? AND m.tipo IN ('SAIDA_EVENTO', 'RETORNO_EVENTO')
-        GROUP BY m.produto_id, m.lote_id
+        GROUP BY m.produto_id, m.lote_id, m.ponto_venda
         HAVING saldo_evento > 0
         ORDER BY p.nome, l.data_validade""", (evento_id,))
+    return df if lanchonete is None else df[df["lanchonete"] == lanchonete].reset_index(drop=True)
+
+
+def lanchonetes_do_evento(evento_id):
+    """Lanchonetes que ainda têm produto no evento, na ordem da lista da casa."""
+    com_saldo = set(estoque_no_evento(evento_id)["lanchonete"].dropna())
+    return [p for p in PONTOS_VENDA if p in com_saldo]
 
 
 def eventos_abertos():
@@ -212,10 +243,10 @@ def enviar_para_evento(evento_id, produto_id, quantidade, usuario, ponto_venda=N
 
 
 def registrar_venda(evento_id, produto_id, quantidade, ponto_venda, pagamento):
-    estoque = estoque_no_evento(evento_id)
+    estoque = estoque_no_evento(evento_id, ponto_venda)
     estoque = estoque[estoque["produto_id"] == produto_id]
     if estoque["saldo_evento"].sum() < quantidade:
-        raise ValueError(f"Só há {num(estoque['saldo_evento'].sum())} unidades deste produto no evento.")
+        raise ValueError(f"Só há {num(estoque['saldo_evento'].sum())} unidades deste produto em {ponto_venda}.")
     preco = q("SELECT preco_venda FROM produtos WHERE id = ?", (produto_id,))["preco_venda"].iloc[0]
     restante = quantidade
     for lote in estoque.itertuples():
@@ -231,12 +262,74 @@ def registrar_venda(evento_id, produto_id, quantidade, ponto_venda, pagamento):
     return preco * quantidade
 
 
+def devolver(evento_id, produto_id, lote_id, lanchonete, quantidade, usuario, obs="Sobra devolvida ao depósito"):
+    con.execute("INSERT INTO movimentacoes (data_hora, tipo, produto_id, lote_id, evento_id, quantidade, usuario,"
+                " observacao, ponto_venda) VALUES (?, 'RETORNO_EVENTO', ?, ?, ?, ?, ?, ?, ?)",
+                (agora(), produto_id, lote_id, evento_id, quantidade, usuario, obs, lanchonete))
+
+
+def registrar_contagem(evento_id, lanchonete, contado, usuario, final=True):
+    """Contagem de uma lanchonete, na abertura (final=False) ou no fechamento (final=True).
+
+    contado: {produto_id: unidades contadas}. Abertura: o contado fica na lanchonete e o que não chegou volta ao
+    depósito. Fechamento: o contado volta ao depósito e a diferença vira perda; ela também passa pelo depósito
+    (retorno + perda por avaria), o que zera o saldo da lanchonete sem alterar o saldo do depósito e leva a falta
+    para as perdas do Painel.
+    """
+    estoque = estoque_no_evento(evento_id, lanchonete)
+    falta = 0
+    for pid, bloco in estoque.groupby("produto_id"):
+        resta = min(int(contado.get(pid, 0)), int(bloco["saldo_evento"].sum()))
+        # Considera contados primeiro os lotes de validade mais longa: os que vencem antes saem antes.
+        for lote in bloco.sort_values("data_validade", ascending=False).itertuples():
+            volta = min(resta, int(lote.saldo_evento))
+            dif = int(lote.saldo_evento) - volta
+            if not final:
+                if dif:
+                    devolver(evento_id, pid, lote.lote_id, lanchonete, dif, usuario,
+                             f"Não conferido na abertura da lanchonete {lanchonete}")
+                    falta += dif
+                resta -= volta
+                continue
+            if volta:
+                devolver(evento_id, pid, lote.lote_id, lanchonete, volta, usuario, f"Contagem da lanchonete {lanchonete}")
+            if dif:
+                devolver(evento_id, pid, lote.lote_id, lanchonete, dif, usuario, "Diferença na contagem")
+                con.execute("INSERT INTO movimentacoes (data_hora, tipo, produto_id, lote_id, evento_id, quantidade,"
+                            " usuario, observacao, ponto_venda) VALUES (?, 'PERDA_AVARIA', ?, ?, ?, ?, ?, ?, ?)",
+                            (agora(), int(pid), lote.lote_id, evento_id, dif, usuario,
+                             f"Diferença na contagem da lanchonete {lanchonete}", lanchonete))
+                falta += dif
+            resta -= volta
+    con.commit()
+    invalidar()
+    return falta
+
+
+def transferir(evento_id, produto_id, origem, destino, quantidade, usuario):
+    """Passa produto de uma lanchonete para outra no mesmo evento (coluna Transferência da folha de controle)."""
+    estoque = estoque_no_evento(evento_id, origem)
+    estoque = estoque[estoque["produto_id"] == produto_id]
+    if estoque["saldo_evento"].sum() < quantidade:
+        raise ValueError(f"Só há {num(estoque['saldo_evento'].sum())} unidades deste produto em {origem}.")
+    restante = quantidade
+    for lote in estoque.itertuples():
+        usar = min(restante, int(lote.saldo_evento))
+        devolver(evento_id, produto_id, lote.lote_id, origem, usar, usuario, f"Transferência para {destino}")
+        con.execute("INSERT INTO movimentacoes (data_hora, tipo, produto_id, lote_id, evento_id, quantidade, usuario,"
+                    " observacao, ponto_venda) VALUES (?, 'SAIDA_EVENTO', ?, ?, ?, ?, ?, ?, ?)",
+                    (agora(), produto_id, lote.lote_id, evento_id, usar, usuario, f"Transferência de {origem}", destino))
+        restante -= usar
+        if restante == 0:
+            break
+    con.commit()
+    invalidar()
+
+
 def encerrar_evento(evento_id, publico_real, usuario):
     sobras = estoque_no_evento(evento_id)
     for s in sobras.itertuples():
-        con.execute("INSERT INTO movimentacoes (data_hora, tipo, produto_id, lote_id, evento_id, quantidade, usuario,"
-                    " observacao) VALUES (?, 'RETORNO_EVENTO', ?, ?, ?, ?, ?, 'Sobra devolvida ao depósito')",
-                    (agora(), s.produto_id, s.lote_id, evento_id, int(s.saldo_evento), usuario))
+        devolver(evento_id, s.produto_id, s.lote_id, s.lanchonete, int(s.saldo_evento), usuario)
     con.execute("UPDATE eventos SET status = 'Realizado', publico_real = ? WHERE id = ?", (publico_real, evento_id))
     con.commit()
     invalidar()
@@ -345,36 +438,37 @@ def pagina_venda(usuario):
         return
     idx = st.selectbox("Evento", abertos.index, format_func=lambda i: rotulo_evento(abertos.loc[i]))
     evento_id = int(abertos.loc[idx, "id"])
-    estoque = estoque_no_evento(evento_id)
-    if estoque.empty:
+    lanchonetes = lanchonetes_do_evento(evento_id)
+    if not lanchonetes:
         st.warning("Este evento não tem mais produtos disponíveis.")
         return
+    # A lanchonete fica fora do formulário: a lista de produtos mostra só o que foi enviado para ela.
+    pdv = st.selectbox("Lanchonete", lanchonetes, key="venda_pdv")
+    estoque = estoque_no_evento(evento_id, pdv)
     disp = estoque.groupby(["produto_id", "produto"], as_index=False)["saldo_evento"].sum()
     with st.form("venda", clear_on_submit=True):
         c1, c2 = st.columns(2)
         pi = c1.selectbox("Produto", disp.index,
                           format_func=lambda i: f"{disp.loc[i, 'produto']} (disponível: {num(disp.loc[i, 'saldo_evento'])})")
         qtd = c2.number_input("Quantidade", min_value=1, value=1, step=1)
-        c3, c4 = st.columns(2)
-        pdv = c3.selectbox("Ponto de venda", PONTOS_VENDA)
-        pag = c4.radio("Forma de pagamento", FORMAS_PAGAMENTO, horizontal=True)
+        pag = st.radio("Forma de pagamento", FORMAS_PAGAMENTO, horizontal=True)
         if st.form_submit_button("Registrar venda", type="primary", width="stretch"):
             try:
                 total = registrar_venda(evento_id, int(disp.loc[pi, "produto_id"]), int(qtd), pdv, pag)
                 st.success(f"Venda registrada: {qtd} × {disp.loc[pi, 'produto']} = {brl(total)}")
             except ValueError as e:
                 st.error(str(e))
-    st.subheader("Estoque no evento")
-    st.dataframe(estoque_no_evento(evento_id)[["produto", "codigo", "data_validade", "saldo_evento"]],
+    st.subheader(f"Estoque em {pdv}")
+    st.dataframe(estoque_no_evento(evento_id, pdv)[["produto", "codigo", "data_validade", "saldo_evento"]],
                  hide_index=True, width="stretch",
                  column_config={"produto": "Produto", "codigo": "Lote", "data_validade": "Validade",
                                 "saldo_evento": "Disponível"})
     ultimas = q("""SELECT v.data_hora, p.nome AS produto, v.quantidade, v.ponto_venda, v.forma_pagamento,
                    v.quantidade * v.preco_unitario AS total
                    FROM vendas v JOIN produtos p ON p.id = v.produto_id
-                   WHERE v.evento_id = ? ORDER BY v.id DESC LIMIT 20""", (evento_id,))
+                   WHERE v.evento_id = ? AND v.ponto_venda = ? ORDER BY v.id DESC LIMIT 20""", (evento_id, pdv))
     if not ultimas.empty:
-        st.subheader("Últimas vendas deste evento")
+        st.subheader("Últimas vendas desta lanchonete")
         st.dataframe(ultimas, hide_index=True, width="stretch")
 
 
@@ -383,8 +477,8 @@ def pagina_movimentacoes(usuario):
     prods = produtos_ativos()
     nome_prod = dict(zip(prods["id"], prods["nome"]))
     # Seletor em vez de abas: no celular as abas ficavam cortadas.
-    aba = st.radio("Operação", ["Entrada (compra)", "Envio para evento", "Encerrar evento", "Perda / ajuste",
-                                "Histórico"], horizontal=True)
+    aba = st.radio("Operação", ["Entrada (compra)", "Envio para evento", "Transferência entre lanchonetes",
+                                "Contagem e encerramento", "Perda / ajuste", "Histórico"], horizontal=True)
 
     if aba == "Entrada (compra)":
         # O produto fica fora do formulário para que embalagem, validade e custo acompanhem a troca de produto.
@@ -427,21 +521,88 @@ def pagina_movimentacoes(usuario):
             st.caption("A quantidade sugerida pelo modelo de ML para cada produto está na página **Previsão de demanda**, "
                        "que também permite enviar tudo de uma vez.")
 
-    elif aba == "Encerrar evento":
+    elif aba == "Transferência entre lanchonetes":
         abertos = eventos_abertos()
         if abertos.empty:
             st.info("Nenhum evento em andamento.")
+            return
+        ei = st.selectbox("Evento", abertos.index, format_func=lambda i: rotulo_evento(abertos.loc[i]), key="tr_ev")
+        evento_id = int(abertos.loc[ei, "id"])
+        lanch = lanchonetes_do_evento(evento_id)
+        if not lanch:
+            st.info("Nenhuma lanchonete com produto neste evento.")
+            return
+        origem = st.selectbox("De (lanchonete que cede)", lanch, key="tr_origem")
+        disp = estoque_no_evento(evento_id, origem).groupby(["produto_id", "produto"], as_index=False)[
+            "saldo_evento"].sum()
+        with st.form("transferencia", clear_on_submit=True):
+            pi = st.selectbox("Produto", disp.index, format_func=lambda i: (
+                f"{disp.loc[i, 'produto']} (disponível: {num(disp.loc[i, 'saldo_evento'])})"))
+            c1, c2 = st.columns(2)
+            destino = c1.selectbox("Para (lanchonete que recebe)", [p for p in PONTOS_VENDA if p != origem])
+            qtd = c2.number_input("Quantidade", min_value=1, value=1, step=1)
+            if st.form_submit_button("Transferir", type="primary"):
+                try:
+                    transferir(evento_id, int(disp.loc[pi, "produto_id"]), origem, destino, int(qtd), usuario)
+                    st.success(f"{num(qtd)} × {disp.loc[pi, 'produto']} transferidos de {origem} para {destino}.")
+                except ValueError as e:
+                    st.error(str(e))
+        st.caption("Para mandar mais produto do depósito (reposição), use **Envio para evento** com a mesma lanchonete.")
+
+    elif aba == "Contagem e encerramento":
+        abertos = eventos_abertos()
+        if abertos.empty:
+            st.info("Nenhum evento em andamento.")
+            return
+        ei = st.selectbox("Evento", abertos.index, format_func=lambda i: rotulo_evento(abertos.loc[i]), key="enc_ev")
+        evento_id = int(abertos.loc[ei, "id"])
+        estoque = estoque_no_evento(evento_id)
+        if not estoque.empty:
+            st.markdown("**1. Contagem por lanchonete (abertura e fechamento)**")
+            resumo = estoque.groupby("lanchonete", dropna=False, as_index=False).agg(
+                produtos=("produto_id", "nunique"), unidades=("saldo_evento", "sum"))
+            st.dataframe(resumo.fillna({"lanchonete": "(sem lanchonete)"}), hide_index=True, width="stretch",
+                         column_config={"lanchonete": "Lanchonete a contar", "produtos": "Produtos",
+                                        "unidades": "Unidades no sistema"})
+            lanchonetes = lanchonetes_do_evento(evento_id)
+            if lanchonetes:
+                pdv = st.selectbox("Lanchonete que está sendo contada", lanchonetes, key="enc_pdv")
+                momento = st.radio("Momento da contagem", ["Abertura (início do evento)", "Fechamento (término)"],
+                                   horizontal=True, key="enc_momento")
+                final = momento.startswith("Fechamento")
+                sist = estoque_no_evento(evento_id, pdv).groupby(["produto_id", "produto"], as_index=False)[
+                    "saldo_evento"].sum().rename(columns={"saldo_evento": "sistema"})
+                sist["contado"] = sist["sistema"]
+                st.caption("Digite na coluna **Contado** a quantidade que sobrou. O contado volta ao depósito; "
+                           "a diferença é registrada como perda." if final else
+                           "Digite na coluna **Contado** o que está na lanchonete. O que não chegou volta ao "
+                           "depósito; para mandar mais, use **Envio para evento**.")
+                editado = st.data_editor(
+                    sist, hide_index=True, width="stretch", key=f"contagem_{evento_id}_{pdv}_{final}",
+                    disabled=["produto_id", "produto", "sistema"], column_order=["produto", "sistema", "contado"],
+                    column_config={"produto": "Produto", "sistema": "No sistema",
+                                   "contado": st.column_config.NumberColumn("Contado", min_value=0, step=1)})
+                if st.button(f"Confirmar contagem de {pdv}", type="primary"):
+                    contado = editado.set_index("produto_id")["contado"].fillna(0)
+                    if (contado > editado.set_index("produto_id")["sistema"]).any():
+                        st.error("A quantidade contada não pode ser maior que a do sistema. Confira a contagem ou "
+                                 "registre a venda que faltou.")
+                    else:
+                        falta = registrar_contagem(evento_id, pdv, contado.astype(int).to_dict(), usuario, final)
+                        st.toast(f"Contagem de {'fechamento' if final else 'abertura'} de {pdv} registrada. "
+                                 f"Diferença: {num(falta)} unidade(s).", icon="✅")
+                        st.rerun()
         else:
-            with st.form("encerrar"):
-                ei = st.selectbox("Evento", abertos.index, format_func=lambda i: rotulo_evento(abertos.loc[i]))
-                evento_id = int(abertos.loc[ei, "id"])
-                est = int(eventos().set_index("id").loc[evento_id, "publico_estimado"])
-                publico = st.number_input("Público real", min_value=1, value=max(est, 1), step=100)
-                st.caption("Ao encerrar, todas as sobras voltam ao depósito (retorno) e o evento passa a 'Realizado', "
-                           "entrando no histórico usado pelo modelo.")
-                if st.form_submit_button("Encerrar evento e devolver sobras", type="primary"):
-                    st.success(f"Evento encerrado. {num(encerrar_evento(evento_id, int(publico), usuario))} "
-                               "unidades devolvidas ao depósito.")
+            st.success("Todas as lanchonetes deste evento já foram contadas.")
+        st.markdown("**2. Encerrar o evento**")
+        with st.form("encerrar"):
+            est = int(eventos().set_index("id").loc[evento_id, "publico_estimado"])
+            publico = st.number_input("Público real", min_value=1, value=max(est, 1), step=100)
+            st.caption("Lanchonetes não contadas devolvem ao depósito o saldo do sistema. O evento passa a "
+                       "'Realizado' e entra no histórico usado pelo modelo.")
+            if st.form_submit_button("Encerrar evento", type="primary"):
+                st.success(f"Evento encerrado. {num(encerrar_evento(evento_id, int(publico), usuario))} "
+                           "unidades devolvidas ao depósito sem contagem.")
 
     elif aba == "Perda / ajuste":
         lotes = saldo_lotes()
@@ -495,6 +656,7 @@ def pagina_estoque(usuario):
     lotes["data_validade"] = pd.to_datetime(lotes["data_validade"])
     lotes["dias_para_vencer"] = (lotes["data_validade"] - pd.Timestamp(hoje())).dt.days
     prods = produtos()
+    prods = prods[(prods["ativo"] == 1) | prods["id"].isin(lotes["produto_id"])]
 
     resumo = prods[["id", "nome", "categoria", "estoque_minimo", "custo_unitario"]].merge(
         lotes.groupby("produto_id", as_index=False)["saldo"].sum(), left_on="id", right_on="produto_id", how="left")
@@ -747,27 +909,35 @@ def erro_evento(nome, data_ev):
 
 
 def campos_produto(chave, p=None):
-    c1, c2, c3 = st.columns(3)
-    nome = c1.text_input("Nome", p["nome"] if p is not None else "", key=f"{chave}_nome")
-    cat = c2.selectbox("Categoria", CATEGORIAS, CATEGORIAS.index(p["categoria"]) if p is not None else 0,
+    """Nome, categoria e preço bastam; em branco (0), os demais campos usam o padrão da categoria."""
+    nome = st.text_input("Nome", p["nome"] if p is not None else "", key=f"{chave}_nome")
+    c1, c2 = st.columns(2)
+    cat = c1.selectbox("Categoria", CATEGORIAS, CATEGORIAS.index(p["categoria"]) if p is not None else 0,
                        key=f"{chave}_cat")
-    unidade = c3.text_input("Unidade", p["unidade"] if p is not None else "un", key=f"{chave}_un")
-    c4, c5, c6, c7, c8 = st.columns(5)
-    preco = c4.number_input("Preço de venda (R$)", 0.0, 1000.0, float(p["preco_venda"]) if p is not None else 10.0,
+    preco = c2.number_input("Preço de venda (R$)", 0.0, 1000.0, float(p["preco_venda"]) if p is not None else 0.0,
                             step=0.5, key=f"{chave}_preco")
-    custo = c5.number_input("Custo (R$)", 0.0, 1000.0, float(p["custo_unitario"]) if p is not None else 3.0,
-                            step=0.5, key=f"{chave}_custo")
-    validade = c6.number_input("Validade (dias)", 1, 3650, int(p["validade_dias"]) if p is not None else 30,
-                               key=f"{chave}_val")
-    emb = c7.number_input("Embalagem (un.)", 1, 1000, int(p["embalagem"]) if p is not None else 12, key=f"{chave}_emb")
-    minimo = c8.number_input("Estoque mínimo", 0, 1_000_000, int(p["estoque_minimo"]) if p is not None else 0,
-                             key=f"{chave}_min")
-    return nome.strip(), cat, unidade.strip() or "un", preco, custo, int(validade), int(emb), int(minimo)
+    with st.expander("Mais detalhes (opcional)"):
+        st.caption(f"Deixe 0 para usar o padrão da categoria; o custo padrão é {CUSTO_PADRAO:.0%} do preço.")
+        c3, c4 = st.columns(2)
+        custo = c3.number_input("Custo (R$)", 0.0, 1000.0, float(p["custo_unitario"]) if p is not None else 0.0,
+                                step=0.5, key=f"{chave}_custo")
+        unidade = c4.text_input("Unidade", p["unidade"] if p is not None else "", key=f"{chave}_un")
+        c5, c6, c7 = st.columns(3)
+        validade = c5.number_input("Validade (dias)", 0, 3650, int(p["validade_dias"]) if p is not None else 0,
+                                   key=f"{chave}_val")
+        emb = c6.number_input("Embalagem (un.)", 0, 1000, int(p["embalagem"]) if p is not None else 0,
+                              key=f"{chave}_emb")
+        minimo = c7.number_input("Estoque mínimo", 0, 1_000_000, int(p["estoque_minimo"]) if p is not None else 0,
+                                 key=f"{chave}_min")
+    un_pad, val_pad, emb_pad = PADRAO_CATEGORIA[cat]
+    return (nome.strip(), cat, unidade.strip() or un_pad, preco, custo or round(preco * CUSTO_PADRAO, 2),
+            int(validade) or val_pad, int(emb) or emb_pad, int(minimo))
 
 
 def pagina_cadastros():
     st.title("🗂️ Cadastros")
-    aba = st.radio("Cadastro", ["Eventos", "Produtos", "Importar produtos (Excel)"], horizontal=True)
+    aba = st.radio("Cadastro", ["Eventos", "Produtos", "Preços em lista", "Importar produtos (Excel)"],
+                   horizontal=True)
 
     if aba == "Eventos":
         modo = st.radio("Ação", ["Novo evento", "Editar ou excluir evento planejado"], horizontal=True,
@@ -830,6 +1000,8 @@ def pagina_cadastros():
                 if st.form_submit_button("Cadastrar produto", type="primary"):
                     if not nome:
                         st.error("Informe o nome do produto.")
+                    elif preco <= 0:
+                        st.error("Informe o preço de venda.")
                     elif nome_em_uso(nome):
                         st.error(f"Já existe um produto chamado \"{nome}\". Use **Editar produto** para alterá-lo.")
                     else:
@@ -854,6 +1026,8 @@ def pagina_cadastros():
                 if st.form_submit_button("Salvar alterações", type="primary"):
                     if not nome:
                         st.error("Informe o nome do produto.")
+                    elif ativo and preco <= 0:
+                        st.error("Informe o preço de venda para deixar o produto ativo.")
                     elif nome_em_uso(nome, produto_id):
                         st.error(f"Já existe outro produto chamado \"{nome}\".")
                     else:
@@ -869,8 +1043,49 @@ def pagina_cadastros():
         st.dataframe(produtos().drop(columns=["id"]), hide_index=True, width="stretch",
                      column_config={"ativo": st.column_config.CheckboxColumn("Ativo")})
 
+    elif aba == "Preços em lista":
+        pagina_precos()
     else:
         pagina_importar_produtos()
+
+
+def pagina_precos():
+    """Preço de um produto por vez, pensado para o celular: salva e já mostra o próximo sem preço."""
+    prods = produtos()
+    pendentes = prods[prods["preco_venda"] <= 0]
+    total = len(prods)
+    st.progress(1 - len(pendentes) / total, f"{total - len(pendentes)} de {total} produtos com preço")
+    so_pendentes = st.toggle("Só produtos sem preço", value=not pendentes.empty,
+                             help="Desligue para corrigir o preço de um produto que já tem preço.")
+    lista = (pendentes if so_pendentes else prods).reset_index(drop=True)
+    if lista.empty:
+        st.success("Todos os produtos já têm preço. 🎉")
+        return
+    # Ao salvar, o produto sai da lista de pendentes e a seleção volta para o primeiro da lista (o próximo).
+    pi = st.selectbox("Produto", lista.index, key="preco_prod", format_func=lambda i: (
+        f"{lista.loc[i, 'nome']} · {lista.loc[i, 'categoria']}"))
+    p = lista.loc[pi]
+    produto_id = int(p["id"])
+    with st.form(f"preco_{produto_id}"):
+        c1, c2 = st.columns(2)
+        preco = c1.number_input("Preço de venda (R$)", 0.0, 1000.0, float(p["preco_venda"]), step=0.5)
+        custo = c2.number_input("Custo (opcional)", 0.0, 1000.0, float(p["custo_unitario"]), step=0.1,
+                                help=f"Em branco (0), o custo é estimado em {CUSTO_PADRAO:.0%} do preço.")
+        if st.form_submit_button("Salvar e ir para o próximo", type="primary", width="stretch"):
+            if preco <= 0:
+                st.error("Informe o preço de venda.")
+            else:
+                con.execute("UPDATE produtos SET preco_venda = ?, custo_unitario = ?, ativo = 1 WHERE id = ?",
+                            (preco, custo or round(preco * CUSTO_PADRAO, 2), produto_id))
+                con.commit()
+                invalidar()
+                st.toast(f"{p['nome']}: {brl(preco)} salvo.", icon="✅")
+                st.rerun()
+    st.caption("Validade e embalagem usam o padrão da categoria e podem ser ajustadas em **Produtos > Editar "
+               "produto**. No computador, também dá para preencher tudo pela planilha em **Importar produtos (Excel)**.")
+    if so_pendentes:
+        st.dataframe(lista[["nome", "categoria"]], hide_index=True, width="stretch",
+                     column_config={"nome": "Ainda sem preço", "categoria": "Categoria"})
 
 
 COLUNAS_IMPORTACAO = ["nome", "categoria", "unidade", "preco_venda", "custo_unitario", "validade_dias", "embalagem",
@@ -919,13 +1134,15 @@ def pagina_importar_produtos():
     if not rejeitados.empty:
         st.dataframe(rejeitados[["nome", "categoria", "problema"]], hide_index=True, width="stretch")
     if not validos.empty and st.button("Importar produtos válidos", type="primary"):
+        ids = {n.strip().lower(): i for i, n in zip(produtos()["id"], produtos()["nome"])}
         for r in validos.itertuples():
             valores = (r.categoria, str(r.unidade), float(r.preco_venda), float(r.custo_unitario), int(r.validade_dias),
                        int(r.embalagem), int(r.estoque_minimo))
-            cur = con.execute("UPDATE produtos SET categoria = ?, unidade = ?, preco_venda = ?, custo_unitario = ?,"
-                              " validade_dias = ?, embalagem = ?, estoque_minimo = ?, ativo = 1"
-                              " WHERE lower(trim(nome)) = lower(?)", (*valores, r.nome))
-            if cur.rowcount == 0:
+            if r.nome.lower() in ids:
+                con.execute("UPDATE produtos SET categoria = ?, unidade = ?, preco_venda = ?, custo_unitario = ?,"
+                            " validade_dias = ?, embalagem = ?, estoque_minimo = ?, ativo = 1 WHERE id = ?",
+                            (*valores, int(ids[r.nome.lower()])))
+            else:
                 con.execute("INSERT INTO produtos (categoria, unidade, preco_venda, custo_unitario, validade_dias,"
                             " embalagem, estoque_minimo, nome) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (*valores, r.nome))
         con.commit()
