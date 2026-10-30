@@ -135,6 +135,9 @@ def conectar() -> sqlite3.Connection:
 
 def criar_banco(con: sqlite3.Connection) -> None:
     con.executescript(SCHEMA)
+    # Ponto de venda (lanchonete) que recebeu o envio ao evento; coluna adicionada depois da primeira versão.
+    if "ponto_venda" not in {c[1] for c in con.execute("PRAGMA table_info(movimentacoes)")}:
+        con.execute("ALTER TABLE movimentacoes ADD COLUMN ponto_venda TEXT")
     con.commit()
 
 

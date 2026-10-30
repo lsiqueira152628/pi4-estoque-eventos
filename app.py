@@ -2,10 +2,12 @@
 
 Uso:  streamlit run app.py
 """
+import io
 import json
 import math
 import os
-from datetime import date, datetime, timedelta
+import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import plotly.express as px
@@ -16,12 +18,20 @@ import gerar_dados
 import ml
 from db import DB_PATH, conectar, consultar, criar_banco
 
-st.set_page_config(page_title="Estoque e Vendas em Eventos", page_icon="📦", layout="wide")
+st.set_page_config(page_title="Estoque e Vendas em Eventos", page_icon="📦", layout="wide",
+                   initial_sidebar_state="collapsed")
 
 CORES = px.colors.qualitative.Safe
 px.defaults.color_discrete_sequence = CORES
-PONTOS_VENDA = ["Bar Central", "Bar Pista", "Quiosque Norte", "Praça de Alimentação"]
+# Lanchonetes da casa, informadas pela comunidade.
+PONTOS_VENDA = ["BAR 3º ANDAR", "BAR 4º ANDAR", "CONCESSÃO 103", "CONCESSÃO 112", "CONCESSÃO 116", "CONCESSÃO 123",
+                "CONCESSÃO 128 - L1", "CONCESSÃO 133", "CONCESSÃO 501", "CONCESSÃO 504", "CONCESSÃO 516",
+                "CONCESSÃO 522", "CONCESSÃO 524", "CONCESSÃO 530"]
 FORMAS_PAGAMENTO = ["Pix", "Crédito", "Débito", "Pulseira cashless"]
+CATEGORIAS = ["Bebida alcoólica", "Bebida não alcoólica", "Café", "Doce", "Lanche", "Snack"]
+TIPOS_EVENTO = ["Show", "Festival", "Evento corporativo", "Evento infantil", "E-sports"]
+# O servidor do Streamlit Cloud roda em UTC; datas e horários do sistema seguem o horário de Brasília.
+FUSO = timezone(timedelta(hours=-3))
 # Na versão publicada o retreino fica desligado, para os testes do grupo não alterarem as métricas do relatório.
 # Para liberar: PERMITIR_RETREINO = "1" nos Secrets do Streamlit Cloud (ou variável de ambiente local).
 PERMITIR_RETREINO = os.environ.get("PERMITIR_RETREINO", "0") == "1"
@@ -69,7 +79,19 @@ def num_curto(v):
 
 
 def agora(segundos=False):
-    return datetime.now().isoformat(sep=" ", timespec="seconds" if segundos else "minutes")
+    return datetime.now(FUSO).replace(tzinfo=None).isoformat(sep=" ", timespec="seconds" if segundos else "minutes")
+
+
+def hoje():
+    return datetime.now(FUSO).date()
+
+
+def baixar_excel(df, arquivo, rotulo="📥 Baixar em Excel", key=None):
+    """Botão de download em .xlsx, que abre direto no Excel (o CSV confunde quem não conhece a extensão)."""
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False, sheet_name="Dados")
+    st.download_button(rotulo, buf.getvalue(), arquivo, key=key,
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 # ---------------------------------------------------------------- consultas (com cache)
@@ -93,6 +115,16 @@ def eventos():
 @st.cache_data
 def produtos():
     return q("SELECT * FROM produtos ORDER BY categoria, nome")
+
+
+def produtos_ativos():
+    prods = produtos()
+    return prods[prods["ativo"] == 1].reset_index(drop=True)
+
+
+def nome_em_uso(nome, exceto_id=None):
+    return not q("SELECT id FROM produtos WHERE lower(trim(nome)) = lower(?) AND id IS NOT ?",
+                 (nome.strip(), exceto_id)).empty
 
 
 @st.cache_data
@@ -146,12 +178,12 @@ def rotulo_evento(row):
 
 # ---------------------------------------------------------------- operações de escrita
 def registrar_entrada(produto_id, quantidade, validade, custo, usuario, obs):
-    hoje = date.today()
+    dia = hoje()
     prox = q("SELECT COALESCE(MAX(id), 0) + 1 AS n FROM lotes")["n"].iloc[0]
-    codigo = f"L{hoje:%y%m%d}-{produto_id:02d}-{prox:05d}"
+    codigo = f"L{dia:%y%m%d}-{produto_id:02d}-{prox:05d}"
     cur = con.execute(
         "INSERT INTO lotes (produto_id, codigo, data_entrada, data_validade, quantidade_inicial, custo_unitario)"
-        " VALUES (?, ?, ?, ?, ?, ?)", (produto_id, codigo, hoje.isoformat(), validade.isoformat(), quantidade, custo))
+        " VALUES (?, ?, ?, ?, ?, ?)", (produto_id, codigo, dia.isoformat(), validade.isoformat(), quantidade, custo))
     con.execute("INSERT INTO movimentacoes (data_hora, tipo, produto_id, lote_id, quantidade, usuario, observacao)"
                 " VALUES (?, 'ENTRADA', ?, ?, ?, ?, ?)", (agora(), produto_id, cur.lastrowid, quantidade, usuario, obs))
     con.commit()
@@ -159,7 +191,7 @@ def registrar_entrada(produto_id, quantidade, validade, custo, usuario, obs):
     return codigo
 
 
-def enviar_para_evento(evento_id, produto_id, quantidade, usuario):
+def enviar_para_evento(evento_id, produto_id, quantidade, usuario, ponto_venda=None):
     """Baixa FIFO (primeiro a vencer, primeiro a sair) só de lotes válidos na data do evento."""
     data_ev = q("SELECT data FROM eventos WHERE id = ?", (evento_id,))["data"].iloc[0]
     lotes = q("SELECT lote_id, saldo FROM vw_saldo_lotes WHERE produto_id = ? AND saldo > 0 AND data_validade >= ?"
@@ -170,8 +202,8 @@ def enviar_para_evento(evento_id, produto_id, quantidade, usuario):
     for lote in lotes.itertuples():
         usar = min(restante, int(lote.saldo))
         con.execute("INSERT INTO movimentacoes (data_hora, tipo, produto_id, lote_id, evento_id, quantidade, usuario,"
-                    " observacao) VALUES (?, 'SAIDA_EVENTO', ?, ?, ?, ?, ?, 'Abastecimento do evento')",
-                    (agora(), produto_id, lote.lote_id, evento_id, usar, usuario))
+                    " observacao, ponto_venda) VALUES (?, 'SAIDA_EVENTO', ?, ?, ?, ?, ?, 'Abastecimento do evento', ?)",
+                    (agora(), produto_id, lote.lote_id, evento_id, usar, usuario, ponto_venda))
         restante -= usar
         if restante == 0:
             break
@@ -231,7 +263,10 @@ def pagina_painel():
         st.info("Selecione o período completo e ao menos um tipo de evento.")
         return
     sel = realizados[realizados["data"].dt.date.between(*periodo) & realizados["tipo"].isin(tipos)]
-    vendas = (vendas_agregadas().merge(sel[["id", "nome", "tipo", "data", "publico_real"]], left_on="evento_id",
+    if sel.empty:
+        st.info("Nenhum evento realizado no período e nos tipos selecionados. Amplie o período.")
+        return
+    vendas =(vendas_agregadas().merge(sel[["id", "nome", "tipo", "data", "publico_real"]], left_on="evento_id",
                                        right_on="id")
               .merge(produtos()[["id", "nome", "categoria"]].rename(columns={"id": "pid", "nome": "produto"}),
                      left_on="produto_id", right_on="pid"))
@@ -254,6 +289,7 @@ def pagina_painel():
                            labels={"mes": "", "receita": "R$", "tipo": "Tipo"}), width="stretch")
 
     publico = sel.set_index("tipo")["publico_real"].groupby(level=0).sum()
+    publico = publico.where(publico > 0)  # evento encerrado sem público não gera divisão por zero
     consumo = vendas.groupby(["categoria", "tipo"])["unidades"].sum().unstack()
     consumo = (consumo / publico * 1000).round(0)
     g2.plotly_chart(px.imshow(consumo, text_auto=True, color_continuous_scale="Blues", aspect="auto",
@@ -289,7 +325,9 @@ def pagina_painel():
     st.subheader("Eventos do período")
     por_evento = vendas.groupby(["data", "nome", "tipo", "publico_real"], as_index=False).agg(
         receita=("receita", "sum"), unidades=("unidades", "sum"))
-    por_evento["receita_por_pessoa"] = por_evento["receita"] / por_evento["publico_real"]
+    por_evento["receita_por_pessoa"] = por_evento["receita"] / por_evento["publico_real"].where(
+        por_evento["publico_real"] > 0)
+    baixar_excel(por_evento.sort_values("data", ascending=False), "eventos_do_periodo.xlsx", key="xl_painel")
     st.dataframe(por_evento.sort_values("data", ascending=False), hide_index=True, width="stretch",
                  column_config={"data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
                                 "nome": "Evento", "tipo": "Tipo", "publico_real": "Público",
@@ -342,29 +380,33 @@ def pagina_venda(usuario):
 
 def pagina_movimentacoes(usuario):
     st.title("📦 Movimentações de estoque")
-    prods = produtos()
+    prods = produtos_ativos()
     nome_prod = dict(zip(prods["id"], prods["nome"]))
-    abas = st.tabs(["Entrada (compra)", "Envio para evento", "Encerrar evento", "Perda / ajuste", "Histórico"])
+    # Seletor em vez de abas: no celular as abas ficavam cortadas.
+    aba = st.radio("Operação", ["Entrada (compra)", "Envio para evento", "Encerrar evento", "Perda / ajuste",
+                                "Histórico"], horizontal=True)
 
-    with abas[0]:
-        with st.form("entrada", clear_on_submit=True):
+    if aba == "Entrada (compra)":
+        # O produto fica fora do formulário para que embalagem, validade e custo acompanhem a troca de produto.
+        pid = st.selectbox("Produto", prods["id"], format_func=nome_prod.get, key="entrada_prod")
+        p = prods.set_index("id").loc[pid]
+        with st.form(f"entrada_{pid}", clear_on_submit=True):
             c1, c2 = st.columns(2)
-            pid = c1.selectbox("Produto", prods["id"], format_func=nome_prod.get)
-            p = prods.set_index("id").loc[pid]
-            qtd = c2.number_input(f"Quantidade (embalagem de {p['embalagem']})", min_value=1,
-                                  value=int(p["embalagem"]), step=int(p["embalagem"]))
-            c3, c4 = st.columns(2)
-            validade = c3.date_input("Data de validade", date.today() + timedelta(days=int(p["validade_dias"])),
+            qtd = c1.number_input(f"Quantidade (embalagem de {p['embalagem']})", min_value=1,
+                                  value=int(p["embalagem"]), step=1)
+            validade = c2.date_input("Data de validade", hoje() + timedelta(days=int(p["validade_dias"])),
                                      format="DD/MM/YYYY")
-            custo = c4.number_input("Custo unitário (R$)", min_value=0.0, value=float(p["custo_unitario"]), step=0.1)
-            obs = st.text_input("Observação", "Recebimento de compra")
+            c3, c4 = st.columns(2)
+            custo = c3.number_input("Custo unitário (R$)", min_value=0.0, value=float(p["custo_unitario"]), step=0.1)
+            obs = c4.text_input("Observação", "Recebimento de compra")
             if st.form_submit_button("Registrar entrada", type="primary"):
-                if validade <= date.today():
+                if validade <= hoje():
                     st.error("A validade precisa ser posterior a hoje.")
                 else:
-                    st.success(f"Lote {registrar_entrada(int(pid), int(qtd), validade, custo, usuario, obs)} registrado.")
+                    codigo = registrar_entrada(int(pid), int(qtd), validade, custo, usuario, obs)
+                    st.success(f"Lote {codigo} registrado: {num(qtd)} × {p['nome']}.")
 
-    with abas[1]:
+    elif aba == "Envio para evento":
         ev = eventos()
         plan = ev[ev["status"] == "Planejado"].reset_index(drop=True)
         if plan.empty:
@@ -374,17 +416,18 @@ def pagina_movimentacoes(usuario):
                 ei = st.selectbox("Evento", plan.index, format_func=lambda i: rotulo_evento(plan.loc[i]))
                 c1, c2 = st.columns(2)
                 pid = c1.selectbox("Produto", prods["id"], format_func=nome_prod.get, key="envio_prod")
-                qtd = c2.number_input("Quantidade", min_value=1, value=100, step=1)
+                pdv = c2.selectbox("Lanchonete (destino)", PONTOS_VENDA)
+                qtd = st.number_input("Quantidade", min_value=1, value=100, step=1)
                 if st.form_submit_button("Enviar para o evento", type="primary"):
                     try:
-                        enviar_para_evento(int(plan.loc[ei, "id"]), int(pid), int(qtd), usuario)
-                        st.success(f"{num(qtd)} × {nome_prod[pid]} enviados para {plan.loc[ei, 'nome']}.")
+                        enviar_para_evento(int(plan.loc[ei, "id"]), int(pid), int(qtd), usuario, pdv)
+                        st.success(f"{num(qtd)} × {nome_prod[pid]} enviados para {pdv} — {plan.loc[ei, 'nome']}.")
                     except ValueError as e:
                         st.error(str(e))
             st.caption("A quantidade sugerida pelo modelo de ML para cada produto está na página **Previsão de demanda**, "
                        "que também permite enviar tudo de uma vez.")
 
-    with abas[2]:
+    elif aba == "Encerrar evento":
         abertos = eventos_abertos()
         if abertos.empty:
             st.info("Nenhum evento em andamento.")
@@ -393,46 +436,56 @@ def pagina_movimentacoes(usuario):
                 ei = st.selectbox("Evento", abertos.index, format_func=lambda i: rotulo_evento(abertos.loc[i]))
                 evento_id = int(abertos.loc[ei, "id"])
                 est = int(eventos().set_index("id").loc[evento_id, "publico_estimado"])
-                publico = st.number_input("Público real", min_value=0, value=est, step=100)
+                publico = st.number_input("Público real", min_value=1, value=max(est, 1), step=100)
                 st.caption("Ao encerrar, todas as sobras voltam ao depósito (retorno) e o evento passa a 'Realizado', "
                            "entrando no histórico usado pelo modelo.")
                 if st.form_submit_button("Encerrar evento e devolver sobras", type="primary"):
                     st.success(f"Evento encerrado. {num(encerrar_evento(evento_id, int(publico), usuario))} "
                                "unidades devolvidas ao depósito.")
 
-    with abas[3]:
+    elif aba == "Perda / ajuste":
         lotes = saldo_lotes()
         lotes = lotes[lotes["saldo"] > 0]
+        if lotes.empty:
+            st.info("Não há lotes com saldo no depósito.")
+            return
         with st.form("perda"):
             tipo = st.radio("Tipo", ["PERDA_VALIDADE", "PERDA_AVARIA", "AJUSTE"], horizontal=True,
                             format_func={"PERDA_VALIDADE": "Perda por validade", "PERDA_AVARIA": "Avaria",
                                          "AJUSTE": "Ajuste de inventário"}.get)
             li = st.selectbox("Lote", lotes.index, format_func=lambda i: (
-                f"{lotes.loc[i, 'produto']} · {lotes.loc[i, 'codigo']} · vence {lotes.loc[i, 'data_validade']} "
-                f"· saldo {num(lotes.loc[i, 'saldo'])}"))
+                f"{lotes.loc[i, 'produto']} · {lotes.loc[i, 'codigo']} · vence "
+                f"{pd.to_datetime(lotes.loc[i, 'data_validade']):%d/%m/%Y} · saldo {num(lotes.loc[i, 'saldo'])}"))
             qtd = st.number_input("Quantidade (no ajuste, use valor negativo para reduzir)", value=1, step=1)
             obs = st.text_input("Motivo / observação")
             if st.form_submit_button("Registrar", type="primary"):
                 saldo = int(lotes.loc[li, "saldo"])
-                if tipo != "AJUSTE" and not 0 < qtd <= saldo:
+                validade = pd.to_datetime(lotes.loc[li, "data_validade"]).date()
+                if tipo == "PERDA_VALIDADE" and validade > hoje():
+                    st.error(f"Este lote vence em {validade:%d/%m/%Y}. Perda por validade só vale para lote vencido; "
+                             "para outros motivos, use Avaria ou Ajuste de inventário.")
+                elif tipo != "AJUSTE" and not 0 < qtd <= saldo:
                     st.error(f"Informe uma quantidade entre 1 e {saldo}.")
                 elif tipo == "AJUSTE" and (qtd == 0 or saldo + qtd < 0):
                     st.error("Ajuste inválido: o saldo do lote não pode ficar negativo.")
+                elif not obs.strip():
+                    st.error("Informe o motivo.")
                 else:
                     registrar_perda_ou_ajuste(tipo, int(lotes.loc[li, "produto_id"]), int(lotes.loc[li, "lote_id"]),
                                               int(qtd), usuario, obs)
                     st.success("Movimentação registrada.")
 
-    with abas[4]:
+    else:
         tipo = st.multiselect("Filtrar tipos", ["ENTRADA", "SAIDA_EVENTO", "RETORNO_EVENTO", "PERDA_VALIDADE",
                                                 "PERDA_AVARIA", "AJUSTE"])
         filtro = f"WHERE m.tipo IN ({','.join('?' * len(tipo))})" if tipo else ""
         hist = q(f"""SELECT m.data_hora, m.tipo, p.nome AS produto, l.codigo AS lote, e.nome AS evento,
-                            m.quantidade, m.usuario, m.observacao
+                            m.ponto_venda AS lanchonete, m.quantidade, m.usuario, m.observacao
                      FROM movimentacoes m JOIN produtos p ON p.id = m.produto_id
                      LEFT JOIN lotes l ON l.id = m.lote_id LEFT JOIN eventos e ON e.id = m.evento_id
                      {filtro} ORDER BY m.id DESC LIMIT 300""", tuple(tipo))
         st.dataframe(hist, hide_index=True, width="stretch")
+        baixar_excel(hist, "historico_movimentacoes.xlsx", key="xl_hist")
 
 
 def pagina_estoque(usuario):
@@ -440,8 +493,7 @@ def pagina_estoque(usuario):
     lotes = saldo_lotes()
     lotes = lotes[lotes["saldo"] > 0].copy()
     lotes["data_validade"] = pd.to_datetime(lotes["data_validade"])
-    hoje = pd.Timestamp(date.today())
-    lotes["dias_para_vencer"] = (lotes["data_validade"] - hoje).dt.days
+    lotes["dias_para_vencer"] = (lotes["data_validade"] - pd.Timestamp(hoje())).dt.days
     prods = produtos()
 
     resumo = prods[["id", "nome", "categoria", "estoque_minimo", "custo_unitario"]].merge(
@@ -472,6 +524,8 @@ def pagina_estoque(usuario):
                  column_config={"nome": "Produto", "categoria": "Categoria", "saldo": "Saldo",
                                 "estoque_minimo": "Mínimo", "situacao": "Situação",
                                 "valor": st.column_config.NumberColumn("Valor (custo)", format="R$ %.2f")})
+    baixar_excel(resumo[["nome", "categoria", "saldo", "estoque_minimo", "valor", "situacao"]], "saldo_por_produto.xlsx",
+                 key="xl_saldo")
 
     st.subheader("Lotes por validade")
     dias = st.slider("Mostrar lotes que vencem nos próximos (dias)", 1, 365, 30)
@@ -483,6 +537,8 @@ def pagina_estoque(usuario):
                                 "dias_para_vencer": st.column_config.ProgressColumn(
                                     "Dias para vencer", min_value=0, max_value=dias, format="%d"),
                                 "saldo": "Saldo"})
+    baixar_excel(prox[["produto", "codigo", "data_entrada", "data_validade", "dias_para_vencer", "saldo"]],
+                 "lotes_por_validade.xlsx", key="xl_lotes")
 
 
 def pagina_previsao(usuario):
@@ -503,6 +559,10 @@ def pagina_previsao(usuario):
     evento_id = int(evento["id"])
 
     prev = ml.prever_eventos(con, [evento_id], margem)
+    # Produto recém-cadastrado não tem vendas para o modelo aprender: não recebe sugestão automática.
+    com_historico = set(q("SELECT DISTINCT produto_id FROM vendas")["produto_id"])
+    prev["historico"] = prev["produto_id"].isin(com_historico).map({True: "Sim", False: "Sem histórico"})
+    prev.loc[prev["historico"] != "Sim", ["previsao", "sugestao"]] = 0
     lotes = saldo_lotes()
     validos = lotes[(lotes["saldo"] > 0) & (lotes["data_validade"] >= evento["data"].date().isoformat())]
     saldo = validos.groupby("produto_id")["saldo"].sum()
@@ -527,22 +587,28 @@ def pagina_previsao(usuario):
                            labels={"value": "Unidades", "produto": "", "variable": ""})
                     .for_each_trace(lambda t: t.update(name={"previsao": "Previsão", "sugestao": "Sugestão"}[t.name])),
                     width="stretch")
-    st.dataframe(prev[["produto", "categoria", "previsao", "sugestao", "ja_enviado", "saldo_deposito", "comprar",
-                       "custo_compra"]].round({"previsao": 0}), hide_index=True, width="stretch",
-                 column_config={"produto": "Produto", "categoria": "Categoria", "previsao": "Previsão (un.)",
+    st.dataframe(prev[["produto", "categoria", "historico", "previsao", "sugestao", "ja_enviado", "saldo_deposito",
+                       "comprar", "custo_compra"]].round({"previsao": 0}), hide_index=True, width="stretch",
+                 column_config={"produto": "Produto", "categoria": "Categoria", "historico": "Histórico",
+                                "previsao": "Previsão (un.)",
                                 "sugestao": "Sugestão de envio", "ja_enviado": "Já no evento",
                                 "saldo_deposito": "Saldo válido no depósito", "comprar": "Comprar",
                                 "custo_compra": st.column_config.NumberColumn("Custo da compra", format="R$ %.2f")})
-    c1, c2 = st.columns(2)
-    c1.download_button("Baixar lista de compras (CSV)", prev[prev["comprar"] > 0][["produto", "comprar", "custo_compra"]]
-                       .to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
-                       f"compras_evento_{evento_id}.csv", "text/csv")
+    if (prev["historico"] != "Sim").any():
+        st.caption("Produtos **sem histórico** ainda não têm vendas registradas: defina a quantidade em "
+                   "**Movimentações > Envio para evento**. Depois de alguns eventos, o modelo passa a prevê-los.")
+    compras = prev[prev["comprar"] > 0][["produto", "comprar", "custo_compra"]].rename(
+        columns={"produto": "Produto", "comprar": "Quantidade a comprar", "custo_compra": "Custo (R$)"})
+    baixar_excel(compras, f"lista_compras_evento_{evento_id}.xlsx", "📥 Baixar lista de compras (Excel)",
+                 key="xl_compras")
+    c1, c2 = st.columns([2, 3], vertical_alignment="bottom")
+    pdv = c1.selectbox("Lanchonete (destino)", PONTOS_VENDA, key="prev_pdv")
     if c2.button("Enviar ao evento a quantidade sugerida (com o estoque disponível)", type="primary"):
         enviados = 0
         for r in prev.itertuples():
             qtd = min(r.sugestao - r.ja_enviado, r.saldo_deposito)
             if qtd > 0:
-                enviar_para_evento(evento_id, r.produto_id, int(qtd), usuario)
+                enviar_para_evento(evento_id, r.produto_id, int(qtd), usuario, pdv)
                 enviados += 1
         st.toast(f"Envio registrado para {enviados} produto(s).", icon="✅")
         st.rerun()
@@ -652,58 +718,219 @@ def pagina_modelo():
                      width="stretch", height=600, column_config={"grupo_nome": "Grupo", "produto": "Produto"})
 
 
+def campos_evento(chave, ev=None):
+    """Campos do formulário de evento; ev traz os valores atuais na edição."""
+    c1, c2, c3 = st.columns(3)
+    nome = c1.text_input("Nome do evento", ev["nome"] if ev is not None else "", key=f"{chave}_nome")
+    tipo = c2.selectbox("Tipo", TIPOS_EVENTO, TIPOS_EVENTO.index(ev["tipo"]) if ev is not None else 0,
+                        key=f"{chave}_tipo")
+    data_ev = c3.date_input("Data", ev["data"].date() if ev is not None else hoje() + timedelta(days=7),
+                            format="DD/MM/YYYY", key=f"{chave}_data")
+    c4, c5, c6, c7 = st.columns(4)
+    hora = c4.number_input("Hora de início", 0, 23, int(ev["hora_inicio"]) if ev is not None else 20,
+                           key=f"{chave}_hora")
+    duracao = c5.number_input("Duração (h)", 1, 16, int(ev["duracao_h"]) if ev is not None else 5,
+                              key=f"{chave}_dur")
+    publico = c6.number_input("Público estimado", 50, 50000, int(ev["publico_estimado"]) if ev is not None else 5000,
+                              step=100, key=f"{chave}_pub")
+    temp = c7.number_input("Temperatura prevista (°C)", -5.0, 45.0,
+                           float(ev["temperatura_prevista"]) if ev is not None else 24.0, step=0.5, key=f"{chave}_temp")
+    return nome.strip(), tipo, data_ev, int(hora), float(duracao), int(publico), float(temp)
+
+
+def erro_evento(nome, data_ev):
+    if not nome:
+        return "Informe o nome do evento."
+    if data_ev < hoje():
+        return "A data do evento não pode estar no passado."
+    return None
+
+
+def campos_produto(chave, p=None):
+    c1, c2, c3 = st.columns(3)
+    nome = c1.text_input("Nome", p["nome"] if p is not None else "", key=f"{chave}_nome")
+    cat = c2.selectbox("Categoria", CATEGORIAS, CATEGORIAS.index(p["categoria"]) if p is not None else 0,
+                       key=f"{chave}_cat")
+    unidade = c3.text_input("Unidade", p["unidade"] if p is not None else "un", key=f"{chave}_un")
+    c4, c5, c6, c7, c8 = st.columns(5)
+    preco = c4.number_input("Preço de venda (R$)", 0.0, 1000.0, float(p["preco_venda"]) if p is not None else 10.0,
+                            step=0.5, key=f"{chave}_preco")
+    custo = c5.number_input("Custo (R$)", 0.0, 1000.0, float(p["custo_unitario"]) if p is not None else 3.0,
+                            step=0.5, key=f"{chave}_custo")
+    validade = c6.number_input("Validade (dias)", 1, 3650, int(p["validade_dias"]) if p is not None else 30,
+                               key=f"{chave}_val")
+    emb = c7.number_input("Embalagem (un.)", 1, 1000, int(p["embalagem"]) if p is not None else 12, key=f"{chave}_emb")
+    minimo = c8.number_input("Estoque mínimo", 0, 1_000_000, int(p["estoque_minimo"]) if p is not None else 0,
+                             key=f"{chave}_min")
+    return nome.strip(), cat, unidade.strip() or "un", preco, custo, int(validade), int(emb), int(minimo)
+
+
 def pagina_cadastros():
     st.title("🗂️ Cadastros")
-    aba_ev, aba_prod = st.tabs(["Eventos", "Produtos"])
-    with aba_ev:
-        with st.form("novo_evento", clear_on_submit=True):
-            st.markdown("**Novo evento planejado**")
-            c1, c2, c3 = st.columns(3)
-            nome = c1.text_input("Nome do evento")
-            tipo = c2.selectbox("Tipo", ["Show", "Festival", "Evento corporativo", "Evento infantil", "E-sports"])
-            data_ev = c3.date_input("Data", date.today() + timedelta(days=7), format="DD/MM/YYYY")
-            c4, c5, c6, c7 = st.columns(4)
-            hora = c4.number_input("Hora de início", 0, 23, 20)
-            duracao = c5.number_input("Duração (h)", 1, 16, 5)
-            publico = c6.number_input("Público estimado", 50, 50000, 5000, step=100)
-            temp = c7.number_input("Temperatura prevista (°C)", -5.0, 45.0, 24.0, step=0.5)
-            if st.form_submit_button("Cadastrar evento", type="primary"):
-                if not nome.strip():
-                    st.error("Informe o nome do evento.")
-                else:
-                    con.execute("INSERT INTO eventos (nome, tipo, data, hora_inicio, duracao_h, publico_estimado,"
-                                " temperatura_prevista, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'Planejado')",
-                                (nome.strip(), tipo, data_ev.isoformat(), int(hora), float(duracao), int(publico),
-                                 float(temp)))
+    aba = st.radio("Cadastro", ["Eventos", "Produtos", "Importar produtos (Excel)"], horizontal=True)
+
+    if aba == "Eventos":
+        modo = st.radio("Ação", ["Novo evento", "Editar ou excluir evento planejado"], horizontal=True,
+                        key="modo_evento")
+        if modo == "Novo evento":
+            with st.form("novo_evento", clear_on_submit=True):
+                nome, tipo, data_ev, hora, duracao, publico, temp = campos_evento("novo_ev")
+                if st.form_submit_button("Cadastrar evento", type="primary"):
+                    if erro := erro_evento(nome, data_ev):
+                        st.error(erro)
+                    else:
+                        con.execute("INSERT INTO eventos (nome, tipo, data, hora_inicio, duracao_h, publico_estimado,"
+                                    " temperatura_prevista, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'Planejado')",
+                                    (nome, tipo, data_ev.isoformat(), hora, duracao, publico, temp))
+                        con.commit()
+                        invalidar()
+                        st.success("Evento cadastrado. Veja a previsão de demanda dele na página **Previsão de demanda**.")
+        else:
+            plan = eventos()
+            plan = plan[plan["status"] == "Planejado"].reset_index(drop=True)
+            if plan.empty:
+                st.info("Não há eventos planejados.")
+            else:
+                st.caption("Só eventos planejados podem ser alterados; os realizados formam o histórico do modelo.")
+                ei = st.selectbox("Evento", plan.index, format_func=lambda i: rotulo_evento(plan.loc[i]),
+                                  key="edit_ev_sel")
+                ev = plan.loc[ei]
+                evento_id = int(ev["id"])
+                with st.form(f"editar_evento_{evento_id}"):
+                    nome, tipo, data_ev, hora, duracao, publico, temp = campos_evento(f"ed_ev_{evento_id}", ev)
+                    if st.form_submit_button("Salvar alterações", type="primary"):
+                        if erro := erro_evento(nome, data_ev):
+                            st.error(erro)
+                        else:
+                            con.execute("UPDATE eventos SET nome = ?, tipo = ?, data = ?, hora_inicio = ?, duracao_h = ?,"
+                                        " publico_estimado = ?, temperatura_prevista = ? WHERE id = ?",
+                                        (nome, tipo, data_ev.isoformat(), hora, duracao, publico, temp, evento_id))
+                            con.commit()
+                            invalidar()
+                            st.success("Evento atualizado.")
+                usado = q("SELECT (SELECT COUNT(*) FROM movimentacoes WHERE evento_id = ?)"
+                          " + (SELECT COUNT(*) FROM vendas WHERE evento_id = ?) AS n", (evento_id, evento_id))["n"].iloc[0]
+                if usado:
+                    st.caption("Este evento já recebeu produtos ou vendas e não pode ser excluído. "
+                               "Para fechá-lo, use **Movimentações > Encerrar evento**.")
+                elif st.button("🗑️ Excluir este evento", key=f"excluir_ev_{evento_id}"):
+                    con.execute("DELETE FROM eventos WHERE id = ?", (evento_id,))
                     con.commit()
                     invalidar()
-                    st.success("Evento cadastrado. Veja a previsão de demanda dele na página **Previsão de demanda**.")
+                    st.rerun()
         ev = eventos().sort_values("data", ascending=False)
         st.dataframe(ev.drop(columns=["id"]), hide_index=True, width="stretch",
                      column_config={"data": st.column_config.DateColumn("Data", format="DD/MM/YYYY")})
-    with aba_prod:
-        with st.form("novo_produto", clear_on_submit=True):
-            st.markdown("**Novo produto**")
-            c1, c2, c3 = st.columns(3)
-            nome = c1.text_input("Nome")
-            cat = c2.selectbox("Categoria", sorted(produtos()["categoria"].unique()))
-            unidade = c3.text_input("Unidade", "un")
-            c4, c5, c6, c7 = st.columns(4)
-            preco = c4.number_input("Preço de venda (R$)", 0.0, 1000.0, 10.0, step=0.5)
-            custo = c5.number_input("Custo (R$)", 0.0, 1000.0, 3.0, step=0.5)
-            validade = c6.number_input("Validade (dias)", 1, 3650, 30)
-            emb = c7.number_input("Embalagem (un.)", 1, 1000, 12)
-            if st.form_submit_button("Cadastrar produto", type="primary"):
-                try:
-                    con.execute("INSERT INTO produtos (nome, categoria, unidade, preco_venda, custo_unitario,"
-                                " validade_dias, embalagem) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                (nome.strip(), cat, unidade, preco, custo, int(validade), int(emb)))
-                    con.commit()
-                    invalidar()
-                    st.success("Produto cadastrado.")
-                except Exception as e:  # nome duplicado
-                    st.error(f"Não foi possível cadastrar: {e}")
-        st.dataframe(produtos().drop(columns=["id", "ativo"]), hide_index=True, width="stretch")
+
+    elif aba == "Produtos":
+        modo = st.radio("Ação", ["Novo produto", "Editar produto"], horizontal=True, key="modo_produto")
+        if modo == "Novo produto":
+            with st.form("novo_produto", clear_on_submit=True):
+                nome, cat, unidade, preco, custo, validade, emb, minimo = campos_produto("novo_prod")
+                if st.form_submit_button("Cadastrar produto", type="primary"):
+                    if not nome:
+                        st.error("Informe o nome do produto.")
+                    elif nome_em_uso(nome):
+                        st.error(f"Já existe um produto chamado \"{nome}\". Use **Editar produto** para alterá-lo.")
+                    else:
+                        con.execute("INSERT INTO produtos (nome, categoria, unidade, preco_venda, custo_unitario,"
+                                    " validade_dias, embalagem, estoque_minimo) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                    (nome, cat, unidade, preco, custo, validade, emb, minimo))
+                        con.commit()
+                        invalidar()
+                        st.success(f"Produto \"{nome}\" cadastrado.")
+                        if preco < custo:
+                            st.warning("Atenção: o preço de venda está abaixo do custo.")
+        else:
+            prods = produtos().reset_index(drop=True)
+            pi = st.selectbox("Produto", prods.index, key="edit_prod_sel", format_func=lambda i: (
+                prods.loc[i, "nome"] + ("" if prods.loc[i, "ativo"] else " (inativo)")))
+            p = prods.loc[pi]
+            produto_id = int(p["id"])
+            with st.form(f"editar_produto_{produto_id}"):
+                nome, cat, unidade, preco, custo, validade, emb, minimo = campos_produto(f"ed_prod_{produto_id}", p)
+                ativo = st.checkbox("Produto ativo (desmarque para tirá-lo das listas sem perder o histórico)",
+                                    bool(p["ativo"]), key=f"ed_prod_{produto_id}_ativo")
+                if st.form_submit_button("Salvar alterações", type="primary"):
+                    if not nome:
+                        st.error("Informe o nome do produto.")
+                    elif nome_em_uso(nome, produto_id):
+                        st.error(f"Já existe outro produto chamado \"{nome}\".")
+                    else:
+                        con.execute("UPDATE produtos SET nome = ?, categoria = ?, unidade = ?, preco_venda = ?,"
+                                    " custo_unitario = ?, validade_dias = ?, embalagem = ?, estoque_minimo = ?,"
+                                    " ativo = ? WHERE id = ?",
+                                    (nome, cat, unidade, preco, custo, validade, emb, minimo, int(ativo), produto_id))
+                        con.commit()
+                        invalidar()
+                        st.success("Produto atualizado.")
+                        if preco < custo:
+                            st.warning("Atenção: o preço de venda está abaixo do custo.")
+        st.dataframe(produtos().drop(columns=["id"]), hide_index=True, width="stretch",
+                     column_config={"ativo": st.column_config.CheckboxColumn("Ativo")})
+
+    else:
+        pagina_importar_produtos()
+
+
+COLUNAS_IMPORTACAO = ["nome", "categoria", "unidade", "preco_venda", "custo_unitario", "validade_dias", "embalagem",
+                      "estoque_minimo"]
+
+
+def pagina_importar_produtos():
+    st.markdown("Cadastre ou atualize vários produtos de uma vez a partir de uma planilha do Excel. "
+                "Produtos com o mesmo nome de um já cadastrado são **atualizados**; os demais são **incluídos**.")
+    modelo = pd.DataFrame([["Água mineral 500ml", "Bebida não alcoólica", "un", 8.0, 2.5, 365, 12, 0]],
+                          columns=COLUNAS_IMPORTACAO)
+    baixar_excel(modelo, "modelo_importacao_produtos.xlsx", "📥 Baixar planilha modelo", key="xl_modelo")
+    st.caption("Categorias aceitas: " + ", ".join(CATEGORIAS) + ". Unidade e estoque mínimo são opcionais.")
+    arquivo = st.file_uploader("Planilha preenchida (.xlsx ou .csv)", type=["xlsx", "csv"])
+    if arquivo is None:
+        return
+    try:
+        df = (pd.read_csv(arquivo, sep=None, engine="python") if arquivo.name.lower().endswith(".csv")
+              else pd.read_excel(arquivo))
+    except Exception:
+        st.error("Não foi possível ler o arquivo. Use a planilha modelo.")
+        return
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    faltando = [c for c in COLUNAS_IMPORTACAO[:7] if c not in df.columns and c != "unidade"]
+    if faltando:
+        st.error("Colunas obrigatórias ausentes: " + ", ".join(faltando) + ". Use a planilha modelo.")
+        return
+    df["unidade"] = df.get("unidade", pd.Series(dtype=str)).fillna("un")
+    df["estoque_minimo"] = df.get("estoque_minimo", pd.Series(dtype=float)).fillna(0)
+    df = df[df["nome"].notna() & (df["nome"].astype(str).str.strip() != "")].copy()
+    df["nome"] = df["nome"].astype(str).str.strip()
+    for c in ["preco_venda", "custo_unitario", "validade_dias", "embalagem", "estoque_minimo"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["problema"] = ""
+    df.loc[~df["categoria"].isin(CATEGORIAS), "problema"] = "categoria inválida"
+    df.loc[df[["preco_venda", "custo_unitario"]].isna().any(axis=1) | (df["preco_venda"] < 0)
+           | (df["custo_unitario"] < 0), "problema"] = "preço ou custo vazio/inválido"
+    df.loc[df["validade_dias"].isna() | (df["validade_dias"] < 1) | df["embalagem"].isna() | (df["embalagem"] < 1),
+           "problema"] = "validade ou embalagem vazia/inválida"
+    df.loc[df["nome"].str.lower().duplicated(keep="first"), "problema"] = "nome repetido na planilha"
+    validos, rejeitados = df[df["problema"] == ""], df[df["problema"] != ""]
+    existentes = set(produtos()["nome"].str.strip().str.lower())
+    novos = (~validos["nome"].str.lower().isin(existentes)).sum()
+    st.write(f"**{len(validos)}** linhas válidas ({novos} novos produtos e {len(validos) - novos} atualizações); "
+             f"**{len(rejeitados)}** com problema.")
+    if not rejeitados.empty:
+        st.dataframe(rejeitados[["nome", "categoria", "problema"]], hide_index=True, width="stretch")
+    if not validos.empty and st.button("Importar produtos válidos", type="primary"):
+        for r in validos.itertuples():
+            valores = (r.categoria, str(r.unidade), float(r.preco_venda), float(r.custo_unitario), int(r.validade_dias),
+                       int(r.embalagem), int(r.estoque_minimo))
+            cur = con.execute("UPDATE produtos SET categoria = ?, unidade = ?, preco_venda = ?, custo_unitario = ?,"
+                              " validade_dias = ?, embalagem = ?, estoque_minimo = ?, ativo = 1"
+                              " WHERE lower(trim(nome)) = lower(?)", (*valores, r.nome))
+            if cur.rowcount == 0:
+                con.execute("INSERT INTO produtos (categoria, unidade, preco_venda, custo_unitario, validade_dias,"
+                            " embalagem, estoque_minimo, nome) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (*valores, r.nome))
+        con.commit()
+        invalidar()
+        st.success(f"{len(validos)} produtos importados.")
 
 
 def pagina_usuarios():
@@ -721,9 +948,11 @@ def pagina_usuarios():
             else:
                 try:
                     auth.criar_usuario(con, login, nome, perfil, senha)
-                    st.success(f"Usuário {login.strip().lower()} cadastrado.")
-                except Exception as e:  # login duplicado ou senha curta
-                    st.error(f"Não foi possível cadastrar: {e}")
+                    st.success(f"Usuário {login.strip()} cadastrado. O login diferencia maiúsculas de minúsculas.")
+                except ValueError as e:  # senha curta ou login já existente
+                    st.error(str(e))
+                except sqlite3.Error:
+                    st.error("Não foi possível cadastrar o usuário. Tente novamente.")
     usuarios = q("SELECT login, nome, perfil, ativo, criado_em FROM usuarios ORDER BY perfil, login")
     st.dataframe(usuarios, hide_index=True, width="stretch",
                  column_config={"login": "Login", "nome": "Nome", "perfil": "Perfil",
@@ -750,7 +979,7 @@ def tela_login():
 # ---------------------------------------------------------------- navegação
 # página: (função, recebe o login do usuário?, perfis com acesso)
 PAGINAS = {
-    "📊 Painel": (pagina_painel, False, {"Administrador", "Estoque", "Vendas"}),
+    "📊 Painel": (pagina_painel, False, {"Administrador"}),
     "🛒 Registrar venda": (pagina_venda, True, {"Administrador", "Vendas"}),
     "📦 Movimentações": (pagina_movimentacoes, True, {"Administrador", "Estoque"}),
     "⏳ Estoque e validade": (pagina_estoque, True, {"Administrador", "Estoque"}),
@@ -766,15 +995,15 @@ if usuario is None:
     st.stop()
 
 permitidas = [nome for nome, (_, _, perfis) in PAGINAS.items() if usuario["perfil"] in perfis]
-with st.sidebar:
-    st.markdown("### 📦 Estoque e Vendas em Eventos")
-    st.caption("PI IV · UNIVESP · dados simulados")
-    escolha = st.radio("Navegação", permitidas, label_visibility="collapsed")
-    st.divider()
-    st.markdown(f"**{usuario['nome']}**  \n{usuario['login']} · {usuario['perfil']}")
+# Menu no topo da página, sempre visível: no celular o menu lateral ficava escondido e cobria a tela.
+topo1, topo2 = st.columns([4, 1], vertical_alignment="bottom")
+escolha = topo1.selectbox("Tela", permitidas, key="tela")
+with topo2:
+    st.caption(f"{usuario['nome']} · {usuario['perfil']}")
     if st.button("Sair", width="stretch"):
         del st.session_state["usuario"]
         st.rerun()
+st.divider()
 
 pagina, recebe_usuario, _ = PAGINAS[escolha]
 if recebe_usuario:

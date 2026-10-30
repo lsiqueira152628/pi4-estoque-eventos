@@ -28,16 +28,19 @@ def criar_usuario(con, login: str, nome: str, perfil: str, senha: str) -> None:
         raise ValueError(f"Perfil inválido: {perfil}")
     if len(senha) < 6:
         raise ValueError("A senha precisa ter pelo menos 6 caracteres.")
+    if con.execute("SELECT 1 FROM usuarios WHERE lower(login) = lower(?)", (login.strip(),)).fetchone():
+        raise ValueError("Já existe um usuário com esse login.")
     senha_hash, salt = gerar_hash(senha)
     con.execute("INSERT INTO usuarios (login, nome, perfil, senha_hash, salt, criado_em) VALUES (?, ?, ?, ?, ?, ?)",
-                (login.strip().lower(), nome.strip(), perfil, senha_hash, salt,
+                (login.strip(), nome.strip(), perfil, senha_hash, salt,
                  datetime.now().isoformat(sep=" ", timespec="seconds")))
     con.commit()
 
 
 def autenticar(con, login: str, senha: str) -> dict | None:
+    # O login diferencia maiúsculas de minúsculas: "Admin" não entra como "admin".
     row = con.execute("SELECT login, nome, perfil, senha_hash, salt FROM usuarios WHERE login = ? AND ativo = 1",
-                      (login.strip().lower(),)).fetchone()
+                      (login.strip(),)).fetchone()
     if row is None:
         gerar_hash(senha)  # mesmo custo de tempo para usuário inexistente
         return None

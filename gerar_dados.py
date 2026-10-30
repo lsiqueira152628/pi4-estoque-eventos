@@ -91,13 +91,15 @@ NOMES_EVENTO = {
 # Temperatura média de São Paulo por mês (°C), usada como previsão do dia
 TEMP_MES = {1: 26, 2: 26, 3: 25, 4: 23, 5: 20, 6: 19, 7: 18, 8: 20, 9: 21, 10: 23, 11: 24, 12: 25}
 
+# Pontos de venda reais da casa (lista da comunidade). O histórico simulado usa quatro deles; manter o tamanho
+# das listas preserva a sequência aleatória e, com ela, os resultados do modelo.
 PONTOS_VENDA = {
-    "Bebida alcoólica": ["Bar Central", "Bar Pista", "Quiosque Norte"],
-    "Bebida não alcoólica": ["Bar Central", "Bar Pista", "Quiosque Norte"],
-    "Café": ["Praça de Alimentação", "Quiosque Norte"],
-    "Lanche": ["Praça de Alimentação", "Quiosque Norte"],
-    "Snack": ["Praça de Alimentação", "Quiosque Norte"],
-    "Doce": ["Praça de Alimentação", "Quiosque Norte"],
+    "Bebida alcoólica": ["BAR 3º ANDAR", "BAR 4º ANDAR", "CONCESSÃO 103"],
+    "Bebida não alcoólica": ["BAR 3º ANDAR", "BAR 4º ANDAR", "CONCESSÃO 103"],
+    "Café": ["CONCESSÃO 112", "CONCESSÃO 103"],
+    "Lanche": ["CONCESSÃO 112", "CONCESSÃO 103"],
+    "Snack": ["CONCESSÃO 112", "CONCESSÃO 103"],
+    "Doce": ["CONCESSÃO 112", "CONCESSÃO 103"],
 }
 
 FORMAS_PAGAMENTO = ["Pix", "Crédito", "Débito", "Pulseira cashless"]

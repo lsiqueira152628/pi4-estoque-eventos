@@ -36,8 +36,10 @@ Se o banco não existir, o `app.py` gera os dados e treina o modelo sozinho na p
 | Login | Senha | Perfil | Acesso |
 |---|---|---|---|
 | admin | admin123 | Administrador | Todas as páginas e gestão de usuários |
-| estoque | estoque123 | Estoque | Painel, movimentações, estoque e validade, previsão, modelo de ML, cadastros |
-| vendas | vendas123 | Vendas | Painel e registro de vendas |
+| estoque | estoque123 | Estoque | Movimentações, estoque e validade, previsão, modelo de ML, cadastros |
+| vendas | vendas123 | Vendas | Registro de vendas |
+
+O Painel com os resultados fica só para o Administrador. O login diferencia maiúsculas de minúsculas.
 
 Essas são as senhas padrão para rodar localmente. No link público, defina outras em
 *Settings > Secrets* do Streamlit Cloud (antes da primeira abertura do app):
